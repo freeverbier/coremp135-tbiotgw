@@ -401,7 +401,7 @@ setup_attribute_reporter() {
 
 set -euo pipefail
 
-CONFIG_FILE="/thingsboard_gateway/config/tb_gateway.yaml"
+CONFIG_FILE="/thingsboard_gateway/config/tb_gateway.json"
 ENV_FILE="/opt/tb-gateway/.env"
 
 log()  { echo "[$(date -u +%H:%M:%S)] [ATTR] $*"; }
@@ -422,10 +422,23 @@ ATTR_REPORT_INTERVAL="${ATTR_REPORT_INTERVAL:-300}"
 # ---- Helpers ----------------------------------------------------------------
 
 get_access_token() {
-    # Read from config file inside the container via docker exec
+    # TB Gateway stores credentials in tb_gateway.json (JSON, not YAML)
     docker exec tb-gateway \
-        grep "^\s*accessToken:" "$CONFIG_FILE" 2>/dev/null \
-        | awk '{print $2}' | tr -d '[:space:]"' | head -1
+        sh -c 'cat /thingsboard_gateway/config/tb_gateway.json 2>/dev/null' \
+        | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    # Try common locations for the access token
+    token = (
+        d.get('thingsboard', {}).get('security', {}).get('accessToken') or
+        d.get('security', {}).get('accessToken') or
+        d.get('accessToken') or ''
+    )
+    print(token.strip())
+except Exception:
+    pass
+" 2>/dev/null || true
 }
 
 wait_for_provisioning() {
@@ -436,13 +449,13 @@ wait_for_provisioning() {
 
     while [[ $attempt -lt $max_attempts ]]; do
         token=$(get_access_token 2>/dev/null || true)
-        if [[ -n "$token" && "$token" != "null" ]]; then
+        if [[ -n "$token" && "$token" != "null" && "$token" != "YOUR_ACCESS_TOKEN" ]]; then
             log "Access token obtained after $((attempt * 5))s"
             echo "$token"
             return 0
         fi
         sleep 5
-        ((attempt++))
+        attempt=$((attempt + 1))
     done
 
     warn "Timed out waiting for provisioning (${max_attempts} attempts)"
@@ -568,6 +581,84 @@ UNITFILE
 }
 
 # -----------------------------------------------------------------------------
+# Display — diagnostic screen on the built-in 320×240 LCD
+# -----------------------------------------------------------------------------
+setup_display() {
+    log "Setting up diagnostic display..."
+
+    # ---- Kill and disable the default M5Stack UI ----------------------------
+    log "Disabling default M5Stack UI..."
+
+    # Known default GUI service names on CoreMP135 Debian images
+    local ui_services=("m5stack-ui" "m5stack_ui" "m5ui" "lvgl-demo" "lvgl_demo"
+                       "lightdm" "gdm3" "sddm" "display-manager")
+    for svc in "${ui_services[@]}"; do
+        if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}"; then
+            log "Disabling service: ${svc}"
+            systemctl stop    "${svc}" 2>/dev/null || true
+            systemctl disable "${svc}" 2>/dev/null || true
+        fi
+    done
+
+    # Kill any process currently holding /dev/fb1
+    local fb_pids
+    fb_pids=$(fuser /dev/fb1 2>/dev/null || true)
+    if [[ -n "$fb_pids" ]]; then
+        log "Killing processes using /dev/fb1: ${fb_pids}"
+        for pid in $fb_pids; do
+            kill -9 "$pid" 2>/dev/null || true
+        done
+    fi
+
+    success "Default UI cleared"
+
+    # ---- Install pygame ------------------------------------------------------
+    log "Installing pygame..."
+    pip3 install pygame --break-system-packages -q
+    success "pygame installed"
+
+    # ---- Deploy display.py from repo ----------------------------------------
+    log "Deploying display.py..."
+    # Download from GitHub repo (same as this script)
+    local script_base="https://raw.githubusercontent.com/freeverbier/coremp135-tbiotgw/main"
+    if curl -fsSL "${script_base}/display.py" -o "${INSTALL_DIR}/display.py" 2>/dev/null; then
+        success "display.py downloaded from GitHub"
+    else
+        warn "Could not download display.py from GitHub — skipping display setup"
+        return 0
+    fi
+    chmod +x "${INSTALL_DIR}/display.py"
+
+    # ---- systemd service for the display ------------------------------------
+    cat > /etc/systemd/system/tb-display.service <<UNITFILE
+[Unit]
+Description=CoreMP135 IoT Gateway Status Display
+After=network-online.target docker.service tb-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+Environment=SDL_VIDEODRIVER=fbcon
+Environment=SDL_FBDEV=/dev/fb1
+Environment=SDL_AUDIODRIVER=dummy
+Environment=SDL_NOMOUSE=1
+ExecStart=/usr/bin/python3 ${INSTALL_DIR}/display.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tb-display
+
+[Install]
+WantedBy=multi-user.target
+UNITFILE
+
+    systemctl daemon-reload
+    systemctl enable --now tb-display.service
+    success "Display service started"
+}
+
+# -----------------------------------------------------------------------------
 # Final status
 # -----------------------------------------------------------------------------
 print_summary() {
@@ -595,6 +686,7 @@ print_summary() {
     echo -e "    tailscale status"
     echo -e "    systemctl status tb-gateway"
     echo -e "    journalctl -u tb-report-attributes -f   # attribute reporter logs"
+    echo -e "    journalctl -u tb-display -f            # display service logs"
     echo ""
 }
 
@@ -624,6 +716,7 @@ main() {
     setup_autostart
     install_tailscale
     setup_attribute_reporter
+    setup_display
 
     print_summary "$mac_address"
 }
