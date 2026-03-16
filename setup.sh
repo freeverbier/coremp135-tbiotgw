@@ -129,6 +129,95 @@ validate_args() {
 }
 
 # -----------------------------------------------------------------------------
+# SD card filesystem expansion
+# Detects root partition automatically and expands it to fill the disk.
+# Safe to run even if already expanded (idempotent).
+# -----------------------------------------------------------------------------
+expand_filesystem() {
+    log "Checking if SD card filesystem needs expansion..."
+
+    # ---- Detect root partition (e.g. /dev/mmcblk0p2 or /dev/sda2) ----------
+    local root_dev
+    root_dev=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/\[.*\]//')
+    if [[ -z "$root_dev" ]]; then
+        warn "Could not determine root device — skipping filesystem expansion"
+        return 0
+    fi
+
+    # ---- Detect parent disk (strip trailing partition number/suffix) ---------
+    local disk disk_name
+    disk_name=$(lsblk -no PKNAME "$root_dev" 2>/dev/null)
+    if [[ -z "$disk_name" ]]; then
+        warn "Could not determine parent disk for $root_dev — skipping"
+        return 0
+    fi
+    disk="/dev/${disk_name}"
+
+    # ---- Detect partition number --------------------------------------------
+    # Works for mmcblk0p2 (→ 2) and sda2 (→ 2)
+    local part_num
+    part_num=$(lsblk -no PARTN "$root_dev" 2>/dev/null)
+    if [[ -z "$part_num" ]]; then
+        part_num=$(echo "$root_dev" | grep -o '[0-9]*$')
+    fi
+    if [[ -z "$part_num" ]]; then
+        warn "Could not determine partition number for $root_dev — skipping"
+        return 0
+    fi
+
+    # ---- Check if expansion is actually needed -------------------------------
+    # Compare partition end to disk size (in sectors)
+    local disk_sectors part_end_sector
+    disk_sectors=$(cat "/sys/block/${disk_name}/size" 2>/dev/null || echo 0)
+    part_end_sector=$(cat "/sys/block/${disk_name}/$(basename "$root_dev")/start" 2>/dev/null || echo 0)
+    part_end_sector=$((part_end_sector + $(cat "/sys/block/${disk_name}/$(basename "$root_dev")/size" 2>/dev/null || echo 0)))
+
+    local free_sectors=$(( disk_sectors - part_end_sector ))
+    # Allow up to 2048 sectors slack (1MB) before deciding expansion is needed
+    if [[ "$free_sectors" -lt 2048 ]]; then
+        success "SD card already fully used by root partition — no expansion needed"
+        return 0
+    fi
+
+    local free_mb=$(( free_sectors / 2048 ))
+    log "Found ~${free_mb}MB of unallocated space after root partition — expanding..."
+
+    # ---- Resize partition ---------------------------------------------------
+    # growpart (cloud-guest-utils) is the simplest; fall back to parted
+    if command -v growpart &>/dev/null; then
+        growpart "$disk" "$part_num" \
+            || { warn "growpart reported no change (already full?)"; }
+    elif command -v parted &>/dev/null; then
+        parted -s "$disk" resizepart "$part_num" 100% \
+            || { warn "parted resizepart failed — skipping filesystem expansion"; return 0; }
+    else
+        warn "Neither growpart nor parted found — cannot expand partition"
+        warn "Run: apt install cloud-guest-utils  then re-run setup.sh"
+        return 0
+    fi
+
+    # Inform kernel of new partition layout
+    partprobe "$disk" 2>/dev/null || true
+    udevadm settle 2>/dev/null || true
+    sleep 1
+
+    # ---- Resize filesystem (ext4 online resize — no unmount needed) ---------
+    if ! command -v resize2fs &>/dev/null; then
+        warn "resize2fs not found — partition resized but filesystem not extended"
+        warn "Run: apt install e2fsprogs  then: resize2fs $root_dev"
+        return 0
+    fi
+
+    log "Running resize2fs on $root_dev (online resize, no reboot needed)..."
+    resize2fs "$root_dev" \
+        || { warn "resize2fs failed — filesystem may need manual intervention"; return 0; }
+
+    local new_size
+    new_size=$(df -h / | awk 'NR==2 {print $2}')
+    success "Filesystem expanded — root is now ${new_size}"
+}
+
+# -----------------------------------------------------------------------------
 # Checks
 # -----------------------------------------------------------------------------
 check_root() {
@@ -234,7 +323,10 @@ install_prerequisites() {
         python3-pil \
         python3-numpy \
         python3-evdev \
-        fonts-dejavu-core
+        fonts-dejavu-core \
+        cloud-guest-utils \
+        parted \
+        e2fsprogs
 
     success "Prerequisites OK"
 }
@@ -838,6 +930,7 @@ main() {
     parse_args "$@"
     validate_args
     check_root
+    expand_filesystem        # resize SD card partition + filesystem before anything else
     check_network
 
     local mac_address
