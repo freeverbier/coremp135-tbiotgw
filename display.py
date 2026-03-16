@@ -204,14 +204,15 @@ def get_tb_status():
     _, logs = _run(["docker", "logs", "--tail", "120", "tb-gateway"], timeout=6)
     ll = logs.lower()
 
-    # Positive — definitive connection confirmations
+    # Positive — definitive connection confirmations (keywords from actual TB Gateway logs)
     connected_kw = [
+        "connected to platform",           # tb_client.py: "MQTT client connected to platform ..."
+        "- connected!",                    # tb_device_mqtt.py: "MQTT client ... - Connected!"
         "connected to thingsboard",
         "successfully connected",
         "tb client connected",
         "gateway connected",
         "provisioning was successful",
-        "[connected]",
         "connection established",
     ]
     if any(k in ll for k in connected_kw):
