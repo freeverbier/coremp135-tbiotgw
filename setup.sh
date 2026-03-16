@@ -473,7 +473,8 @@ services:
       - "50000:50000/udp"   # Socket connector — UDP
       - "47808:47808/udp"   # BACnet/IP (standard port)
       - "502:502"           # Modbus TCP (Master → slave, standard port)
-      - "4840:4840"         # OPC-UA server
+      # OPC-UA (4840) excluded: asyncua pip install is OOM-killed on 256MB ARM
+      # Enable from TB Gateway UI + add port manually if needed on higher-RAM hardware
 
     # Required for "host" network services (e.g. local Modbus/BACnet devices)
     extra_hosts:

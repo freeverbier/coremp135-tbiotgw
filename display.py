@@ -580,7 +580,7 @@ class GatewayDisplay:
                 "ts_state":      ts_state,
                 "ts_ip":         ts_ip or "—",
                 "eth0_ip":       get_eth0_ip(),
-                "mac":           get_mac(),
+                "mac":           "coremp135-" + get_mac().replace(":", "-"),
                 "uptime":        get_uptime(),
                 "hostname":      socket.gethostname(),
                 "refreshed_at":  time.strftime("%H:%M:%S"),
