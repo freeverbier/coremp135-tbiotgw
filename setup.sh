@@ -45,12 +45,14 @@ error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 # -----------------------------------------------------------------------------
 TB_GW_HOST=""
 TB_GW_PORT="8883"
+TB_GW_HTTP_PORT="443"      # ThingsBoard HTTPS port for device HTTP API
 TB_GW_PROVISIONING_DEVICE_KEY=""
 TB_GW_PROVISIONING_DEVICE_SECRET=""
 TAILSCALE_AUTH_KEY=""
 TAILSCALE_HOSTNAME=""      # Auto-detected if empty
 INSTALL_DIR="/opt/tb-gateway"
 ENV_FILE=""
+ATTR_REPORT_INTERVAL="300" # Attribute report interval in seconds (default: 5 min)
 
 # -----------------------------------------------------------------------------
 # Argument parsing
@@ -64,6 +66,8 @@ parse_args() {
             --tb-provision-secret=*)  TB_GW_PROVISIONING_DEVICE_SECRET="${arg#*=}" ;;
             --tailscale-key=*)        TAILSCALE_AUTH_KEY="${arg#*=}" ;;
             --tailscale-hostname=*)   TAILSCALE_HOSTNAME="${arg#*=}" ;;
+            --tb-http-port=*)         TB_GW_HTTP_PORT="${arg#*=}" ;;
+            --attr-interval=*)        ATTR_REPORT_INTERVAL="${arg#*=}" ;;
             --install-dir=*)          INSTALL_DIR="${arg#*=}" ;;
             --env-file=*)             ENV_FILE="${arg#*=}" ;;
             --help|-h)                usage; exit 0 ;;
@@ -94,7 +98,9 @@ Required:
 
 Optional:
   --tb-port=PORT               ThingsBoard MQTT port (default: 8883)
+  --tb-http-port=PORT          ThingsBoard HTTPS port for device API (default: 443)
   --tailscale-hostname=NAME    Tailscale hostname override (default: coremp135-<MAC>)
+  --attr-interval=SECS         Attribute report interval in seconds (default: 300)
   --install-dir=DIR            Installation directory (default: /opt/tb-gateway)
   --env-file=FILE              Load all config from a .env file
   --help                       Show this help
@@ -347,6 +353,189 @@ install_tailscale() {
 }
 
 # -----------------------------------------------------------------------------
+# Attribute reporter — pushes device attributes to ThingsBoard every N seconds
+# -----------------------------------------------------------------------------
+setup_attribute_reporter() {
+    log "Setting up ThingsBoard attribute reporter..."
+
+    # ---- report-attributes.sh -----------------------------------------------
+    cat > "${INSTALL_DIR}/report-attributes.sh" <<'REPORTER'
+#!/usr/bin/env bash
+# =============================================================================
+# TB Gateway — Device Attribute Reporter
+# Reads device info and pushes it as client-side attributes to ThingsBoard.
+# Runs as a systemd service (tb-report-attributes.service).
+# =============================================================================
+
+set -euo pipefail
+
+CONFIG_FILE="/thingsboard_gateway/config/tb_gateway.yaml"
+ENV_FILE="/opt/tb-gateway/.env"
+
+log()  { echo "[$(date -u +%H:%M:%S)] [ATTR] $*"; }
+warn() { echo "[$(date -u +%H:%M:%S)] [WARN] $*" >&2; }
+
+# Load runtime config (TB_GW_HOST, TB_GW_HTTP_PORT)
+if [[ -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+fi
+
+TB_GW_HOST="${TB_GW_HOST:-}"
+TB_GW_HTTP_PORT="${TB_GW_HTTP_PORT:-443}"
+ATTR_REPORT_INTERVAL="${ATTR_REPORT_INTERVAL:-300}"
+
+[[ -z "$TB_GW_HOST" ]] && { warn "TB_GW_HOST not set — aborting"; exit 1; }
+
+# ---- Helpers ----------------------------------------------------------------
+
+get_access_token() {
+    # Read from config file inside the container via docker exec
+    docker exec tb-gateway \
+        grep "^\s*accessToken:" "$CONFIG_FILE" 2>/dev/null \
+        | awk '{print $2}' | tr -d '[:space:]"' | head -1
+}
+
+wait_for_provisioning() {
+    log "Waiting for TB Gateway provisioning to complete..."
+    local max_attempts=60   # 5 min max (60 × 5s)
+    local attempt=0
+    local token=""
+
+    while [[ $attempt -lt $max_attempts ]]; do
+        token=$(get_access_token 2>/dev/null || true)
+        if [[ -n "$token" && "$token" != "null" ]]; then
+            log "Access token obtained after $((attempt * 5))s"
+            echo "$token"
+            return 0
+        fi
+        sleep 5
+        ((attempt++))
+    done
+
+    warn "Timed out waiting for provisioning (${max_attempts} attempts)"
+    return 1
+}
+
+collect_attributes() {
+    local mac eth0_ip tailscale_ip os_version tb_image_tag
+
+    # MAC address eth0
+    mac=$(cat /sys/class/net/eth0/address 2>/dev/null \
+        || ip link show eth0 | awk '/ether/ {print $2}')
+
+    # eth0 IP (exclude 169.254.x.x link-local)
+    eth0_ip=$(ip -4 addr show eth0 2>/dev/null \
+        | awk '/inet / && !/169\.254/ {print $2}' \
+        | cut -d/ -f1 | head -1)
+    [[ -z "$eth0_ip" ]] && eth0_ip="unknown"
+
+    # Tailscale IP
+    tailscale_ip=$(tailscale ip -4 2>/dev/null || echo "unavailable")
+
+    # OS version (clean string)
+    os_version=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}" \
+        || uname -r)
+
+    # TB Gateway Docker image tag (version)
+    tb_image_tag=$(docker inspect tb-gateway \
+        --format '{{index .Config.Image}}' 2>/dev/null || echo "unknown")
+
+    # Build JSON payload
+    jq -n \
+        --arg mac        "$mac" \
+        --arg eth0_ip    "$eth0_ip" \
+        --arg ts_ip      "$tailscale_ip" \
+        --arg hostname   "$(hostname)" \
+        --arg os_ver     "$os_version" \
+        --arg tb_image   "$tb_image_tag" \
+        --arg uptime     "$(awk '{printf "%dd %dh %dm", $1/86400, ($1%86400)/3600, ($1%3600)/60}' /proc/uptime)" \
+        '{
+            mac_address:    $mac,
+            eth0_ip:        $eth0_ip,
+            tailscale_ip:   $ts_ip,
+            hostname:       $hostname,
+            os_version:     $os_ver,
+            tb_gateway_image: $tb_image,
+            uptime:         $uptime
+        }'
+}
+
+push_attributes() {
+    local token="$1"
+    local payload
+    payload=$(collect_attributes)
+
+    local url="https://${TB_GW_HOST}:${TB_GW_HTTP_PORT}/api/v1/${token}/attributes"
+
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X POST "$url" \
+        -H "Content-Type: application/json" \
+        -d "$payload" \
+        --max-time 15)
+
+    if [[ "$http_code" == "200" ]]; then
+        log "Attributes pushed OK — eth0=$(echo "$payload" | jq -r .eth0_ip) tailscale=$(echo "$payload" | jq -r .tailscale_ip)"
+    else
+        warn "Push failed (HTTP ${http_code}) — will retry at next interval"
+    fi
+}
+
+# ---- Main loop --------------------------------------------------------------
+main() {
+    local token
+    token=$(wait_for_provisioning) || exit 1
+
+    log "Starting attribute reporter (interval: ${ATTR_REPORT_INTERVAL}s)"
+
+    while true; do
+        push_attributes "$token"
+        sleep "$ATTR_REPORT_INTERVAL"
+    done
+}
+
+main
+REPORTER
+
+    chmod +x "${INSTALL_DIR}/report-attributes.sh"
+
+    # ---- Inject TB_GW_HTTP_PORT and ATTR_REPORT_INTERVAL into the .env ------
+    # (used by report-attributes.sh at runtime)
+    if ! grep -q "^TB_GW_HTTP_PORT=" "${INSTALL_DIR}/.env" 2>/dev/null; then
+        echo "TB_GW_HTTP_PORT=${TB_GW_HTTP_PORT}" >> "${INSTALL_DIR}/.env"
+    fi
+    if ! grep -q "^ATTR_REPORT_INTERVAL=" "${INSTALL_DIR}/.env" 2>/dev/null; then
+        echo "ATTR_REPORT_INTERVAL=${ATTR_REPORT_INTERVAL}" >> "${INSTALL_DIR}/.env"
+    fi
+
+    # ---- systemd service (runs the reporter loop) ---------------------------
+    cat > /etc/systemd/system/tb-report-attributes.service <<UNITFILE
+[Unit]
+Description=ThingsBoard Gateway — Device Attribute Reporter
+Requires=tb-gateway.service docker.service
+After=tb-gateway.service docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=30
+ExecStart=${INSTALL_DIR}/report-attributes.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tb-report-attributes
+
+[Install]
+WantedBy=multi-user.target
+UNITFILE
+
+    systemctl daemon-reload
+    systemctl enable --now tb-report-attributes.service
+    success "Attribute reporter service started (interval: ${ATTR_REPORT_INTERVAL}s)"
+}
+
+# -----------------------------------------------------------------------------
 # Final status
 # -----------------------------------------------------------------------------
 print_summary() {
@@ -373,6 +562,7 @@ print_summary() {
     echo -e "    docker compose -f ${INSTALL_DIR}/docker-compose.yml ps"
     echo -e "    tailscale status"
     echo -e "    systemctl status tb-gateway"
+    echo -e "    journalctl -u tb-report-attributes -f   # attribute reporter logs"
     echo ""
 }
 
@@ -401,6 +591,7 @@ main() {
     setup_tb_gateway "$mac_address"
     setup_autostart
     install_tailscale
+    setup_attribute_reporter
 
     print_summary "$mac_address"
 }
