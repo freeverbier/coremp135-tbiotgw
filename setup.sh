@@ -290,21 +290,51 @@ setup_timezone() {
     timedatectl set-timezone "${TIMEZONE}"
     success "Timezone set to ${TIMEZONE}"
 
-    # Ensure chrony is installed (more reliable than systemd-timesyncd on embedded)
-    if ! command -v chronyd &>/dev/null; then
+    # ---- NTP client — cascade: chrony → ntp → systemd-timesyncd (always present) ----
+    local ntp_client=""
+
+    if command -v chronyd &>/dev/null; then
+        ntp_client="chrony"
+    elif apt-cache show chrony &>/dev/null 2>&1; then
         log "Installing chrony (NTP client)..."
-        apt-get install -y -qq chrony
+        apt-get install -y -qq chrony && ntp_client="chrony"
     fi
 
-    # Enable and start chrony
-    systemctl enable --now chrony 2>/dev/null || systemctl enable --now chronyd 2>/dev/null || true
+    if [[ -z "$ntp_client" ]] && apt-cache show ntp &>/dev/null 2>&1; then
+        log "chrony not available — installing ntp..."
+        apt-get install -y -qq ntp && ntp_client="ntp"
+    fi
 
-    # Disable systemd-timesyncd if chrony takes over (avoid conflicts)
-    systemctl disable --now systemd-timesyncd 2>/dev/null || true
+    if [[ -z "$ntp_client" ]]; then
+        log "Using systemd-timesyncd (built-in)..."
+        ntp_client="timesyncd"
+    fi
 
-    # Force immediate time sync
-    log "Forcing NTP sync..."
-    chronyc makestep 2>/dev/null || true
+    case "$ntp_client" in
+        chrony)
+            systemctl disable --now systemd-timesyncd 2>/dev/null || true
+            systemctl enable --now chrony 2>/dev/null \
+                || systemctl enable --now chronyd 2>/dev/null || true
+            chronyc makestep 2>/dev/null || true
+            ;;
+        ntp)
+            systemctl disable --now systemd-timesyncd 2>/dev/null || true
+            systemctl enable --now ntp 2>/dev/null || true
+            ;;
+        timesyncd)
+            # Configure NTP servers
+            mkdir -p /etc/systemd/timesyncd.conf.d
+            cat > /etc/systemd/timesyncd.conf.d/ntp.conf <<'NTPCFG'
+[Time]
+NTP=0.pool.ntp.org 1.pool.ntp.org 2.pool.ntp.org 3.pool.ntp.org
+FallbackNTP=time.google.com time.cloudflare.com
+NTPCFG
+            systemctl enable --now systemd-timesyncd 2>/dev/null || true
+            timedatectl set-ntp true 2>/dev/null || true
+            ;;
+    esac
+
+    success "NTP client: ${ntp_client}"
 
     # Wait up to 10s for sync
     local synced=0
