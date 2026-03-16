@@ -365,7 +365,9 @@ TB_GW_HOST=${TB_GW_HOST}
 TB_GW_PORT=${TB_GW_PORT}
 TB_GW_PROVISIONING_DEVICE_KEY=${TB_GW_PROVISIONING_DEVICE_KEY}
 TB_GW_PROVISIONING_DEVICE_SECRET=${TB_GW_PROVISIONING_DEVICE_SECRET}
-TB_GW_PROVISIONING_DEVICE_NAME=${mac_address}
+# TB_GW_DEVICE_NAME sets the gateway device name on ThingsBoard.
+# We use the host eth0 MAC so each box gets a unique, traceable identity.
+TB_GW_DEVICE_NAME=coremp135-${mac_address}
 ENVFILE
 
     chmod 600 "${INSTALL_DIR}/.env"
@@ -375,6 +377,73 @@ ENVFILE
     log "Starting ThingsBoard IoT Gateway..."
     docker compose -f "${INSTALL_DIR}/docker-compose.yml" up -d
     success "TB Gateway container started"
+}
+
+# -----------------------------------------------------------------------------
+# Patch TB Gateway config: enable remote logging + remote shell
+# Must be called after setup_tb_gateway() — waits for provisioning to finish,
+# then injects remoteLoggingLevel + remoteShell into tb_gateway.json.
+# -----------------------------------------------------------------------------
+patch_tb_gateway_config() {
+    log "Waiting for TB Gateway provisioning before patching config..."
+
+    local max_attempts=60   # 5 min max (60 × 5s)
+    local attempt=0
+    local token=""
+
+    while [[ $attempt -lt $max_attempts ]]; do
+        token=$(docker exec tb-gateway \
+            python3 -c "
+import json, sys
+try:
+    with open('/thingsboard_gateway/config/tb_gateway.json') as f:
+        d = json.load(f)
+    tb = d.get('thingsboard', {}) or {}
+    t = (tb.get('security', {}).get('accessToken')
+         or tb.get('credentials', {}).get('token')
+         or tb.get('credentials', {}).get('accessToken')
+         or d.get('security', {}).get('accessToken', ''))
+    if t and t not in ('YOUR_ACCESS_TOKEN', 'null', ''):
+        print(t.strip())
+except Exception:
+    pass
+" 2>/dev/null || true)
+
+        if [[ -n "$token" ]]; then
+            log "Provisioning complete (token obtained after $((attempt * 5))s)"
+            break
+        fi
+        sleep 5
+        attempt=$((attempt + 1))
+    done
+
+    if [[ $attempt -ge $max_attempts ]]; then
+        warn "Timed out waiting for provisioning — skipping remote config patch"
+        return 0
+    fi
+
+    # Patch the JSON inside the running container
+    docker exec tb-gateway python3 -c "
+import json, sys
+cfg = '/thingsboard_gateway/config/tb_gateway.json'
+try:
+    with open(cfg) as f:
+        d = json.load(f)
+    tb = d.setdefault('thingsboard', {})
+    tb['remoteLoggingLevel'] = 'DEBUG'
+    tb['remoteShell']        = True
+    with open(cfg, 'w') as f:
+        json.dump(d, f, indent=2)
+    print('patched OK')
+except Exception as e:
+    print(f'patch error: {e}', file=sys.stderr)
+    sys.exit(1)
+" || { warn "Config patch failed — gateway will still work, remote logging disabled"; return 0; }
+
+    # Restart gateway to pick up patched config
+    log "Restarting TB Gateway to apply remote logging + remote shell..."
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" restart tb-gateway
+    success "TB Gateway patched: remoteLoggingLevel=DEBUG, remoteShell=true"
 }
 
 # -----------------------------------------------------------------------------
@@ -780,12 +849,22 @@ main() {
     install_docker
     install_docker_compose
     setup_tb_gateway "$mac_address"
+    patch_tb_gateway_config          # wait for provisioning → enable remote logging + remote shell
     setup_autostart
     install_tailscale
     setup_attribute_reporter
     setup_display
 
     print_summary "$mac_address"
+
+    # Reboot to ensure all services start cleanly from a known state
+    log ""
+    log "============================================================"
+    log "  Setup complete — rebooting in 15 seconds"
+    log "  Press Ctrl+C to cancel the reboot"
+    log "============================================================"
+    sleep 15
+    reboot
 }
 
 main "$@"
