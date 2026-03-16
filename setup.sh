@@ -187,14 +187,34 @@ install_prerequisites() {
 # -----------------------------------------------------------------------------
 # Docker
 # -----------------------------------------------------------------------------
+fix_iptables_legacy() {
+    # Debian Bookworm defaults to nftables backend which is unsupported on many
+    # embedded ARM kernels (CoreMP135 included). Switch to iptables-legacy.
+    if command -v update-alternatives &>/dev/null \
+        && update-alternatives --list iptables 2>/dev/null | grep -q legacy; then
+        log "Switching iptables to legacy backend (nftables unsupported on this kernel)..."
+        update-alternatives --set iptables  /usr/sbin/iptables-legacy
+        update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+        success "iptables-legacy set"
+    else
+        warn "iptables-legacy not found — Docker networking may fail on this kernel"
+    fi
+}
+
 install_docker() {
     if command -v docker &>/dev/null; then
         success "Docker already installed: $(docker --version)"
+        # Still ensure iptables-legacy is set even if Docker was pre-installed
+        fix_iptables_legacy
+        systemctl restart docker
         return 0
     fi
 
     log "Installing Docker (official get.docker.com script)..."
     curl -fsSL https://get.docker.com | sh
+
+    # Must fix iptables BEFORE starting Docker on embedded ARM kernels
+    fix_iptables_legacy
 
     systemctl enable docker
     systemctl start docker
