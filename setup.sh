@@ -577,48 +577,47 @@ grep -o "\"accessToken\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$CFG" 2>/dev/null 
 }
 
 # -----------------------------------------------------------------------------
-# Pre-provisioning: patch device name in tb_gateway.yaml (if present)
-# Called right after the container starts, before it has a chance to provision.
-# TB Gateway reads its config before connecting, so we can inject the name here.
+# Pre-provisioning: inject device name into tb_gateway.json
+# tb_gateway.json is the main config for this TB Gateway Docker image (JSON,
+# not YAML). Called right after the container starts. We wait for the entrypoint
+# to create the file, then add/replace the deviceName field before the gateway
+# connects and sends a provisioning request to ThingsBoard.
 # -----------------------------------------------------------------------------
-_patch_gateway_yaml_name() {
+_patch_gateway_device_name() {
     local device_name="$1"
-    local yaml_cfg="/thingsboard_gateway/config/tb_gateway.yaml"
+    local cfg="/thingsboard_gateway/config/tb_gateway.json"
 
-    # Wait up to 30s for the YAML to be created by the container entrypoint
+    # Wait up to 30s for the config to be created by the container entrypoint
     local i=0
     while [[ $i -lt 15 ]]; do
-        if docker exec tb-gateway sh -c "[ -f ${yaml_cfg} ]" 2>/dev/null; then
+        if docker exec tb-gateway sh -c "[ -f ${cfg} ]" 2>/dev/null; then
             break
         fi
         sleep 2
         i=$((i + 1))
     done
 
-    if ! docker exec tb-gateway sh -c "[ -f ${yaml_cfg} ]" 2>/dev/null; then
-        warn "tb_gateway.yaml not found in container — skipping YAML device-name patch"
+    if ! docker exec tb-gateway sh -c "[ -f ${cfg} ]" 2>/dev/null; then
+        warn "tb_gateway.json not found after 30s — skipping device-name pre-patch"
         return 0
     fi
 
-    # Patch: replace any existing deviceName / provisionDeviceName / device_name line,
-    # or inject after the 'thingsboard:' key if not present.
+    # Inject deviceName into the JSON using python3 (in-image) or sed fallback
     docker exec tb-gateway sh -c "
-set -e
-CFG='${yaml_cfg}'
-NAME='${device_name}'
-
-# Replace known device-name keys if they exist
-sed -i \"s/^[[:space:]]*deviceName:.*/  deviceName: \${NAME}/\" \"\$CFG\"
-sed -i \"s/^[[:space:]]*provisionDeviceName:.*/  provisionDeviceName: \${NAME}/\" \"\$CFG\"
-sed -i \"s/^[[:space:]]*device_name:.*/  device_name: \${NAME}/\" \"\$CFG\"
-
-# If still no deviceName field, inject under 'thingsboard:' block
-if ! grep -q 'deviceName:' \"\$CFG\"; then
-    sed -i \"/^thingsboard:/a\\  deviceName: \${NAME}\" \"\$CFG\" || true
-fi
-
-echo 'YAML device name patched'
-" 2>&1 | while IFS= read -r line; do log "  [yaml-patch] $line"; done || true
+python3 -c \"
+import json
+cfg = '/thingsboard_gateway/config/tb_gateway.json'
+name = '${device_name}'
+with open(cfg) as f:
+    d = json.load(f)
+tb = d.setdefault('thingsboard', {})
+tb['deviceName'] = name
+tb.setdefault('security', {})['provisionDeviceName'] = name
+with open(cfg, 'w') as f:
+    json.dump(d, f, indent=2)
+print('device name set to ' + name)
+\" 2>/dev/null || echo 'python3 not available — device name not pre-patched'
+" 2>&1 | while IFS= read -r line; do log "  [name-patch] $line"; done || true
 }
 
 # -----------------------------------------------------------------------------
@@ -629,9 +628,9 @@ echo 'YAML device name patched'
 patch_tb_gateway_config() {
     local device_name="$1"
 
-    # ---- Step 1: Patch tb_gateway.yaml for device name (before provisioning) -----
-    log "Patching gateway device name in tb_gateway.yaml before provisioning..."
-    _patch_gateway_yaml_name "$device_name"
+    # ---- Step 1: Inject device name into tb_gateway.json (before provisioning) -----
+    log "Injecting device name into tb_gateway.json before provisioning..."
+    _patch_gateway_device_name "$device_name"
 
     # ---- Step 2: Wait for provisioning to complete (token appears in JSON) -------
     log "Waiting for TB Gateway provisioning (up to 3 min)..."
