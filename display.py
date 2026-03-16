@@ -306,8 +306,7 @@ class Renderer:
 
         # ---- Title bar -------------------------------------------------------
         draw.rectangle([0, 0, SCREEN_W, self.TITLE_H], fill=BLUE)
-        hostname = status.get("hostname", "CoreMP135")
-        self._txt(draw, self.f_title, f"  {hostname}", (0, 6))
+        self._txt(draw, self.f_title, "  EnerBox - MP135", (0, 6))
 
         y = self.TITLE_H + 2
 
