@@ -182,6 +182,7 @@ install_prerequisites() {
         wget \
         python3 \
         python3-pil \
+        python3-numpy \
         python3-evdev \
         fonts-dejavu-core
 
@@ -282,6 +283,15 @@ services:
     # Environment loaded from .env file (generated at provision time)
     env_file:
       - .env
+
+    # Resource limits — important on ARM Cortex-A7 (single core, 256MB RAM)
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"     # max 75% of one core
+          memory: 256M
+        reservations:
+          memory: 64M
 
     volumes:
       - tb-gw-config:/thingsboard_gateway/config

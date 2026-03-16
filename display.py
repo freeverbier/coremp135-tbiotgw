@@ -45,6 +45,13 @@ except ImportError:
     sys.exit(1)
 
 try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+    print("[WARN] numpy not found — using slower RGB565 conversion. apt install python3-numpy")
+
+try:
     import evdev
     from evdev import InputDevice, categorize, ecodes
     HAS_EVDEV = True
@@ -122,10 +129,30 @@ class Framebuffer:
             print(f"[FB] Write error: {e}")
 
     def _to_rgb565_strided(self, img):
+        if HAS_NUMPY:
+            return self._to_rgb565_numpy(img)
+        return self._to_rgb565_pure(img)
+
+    def _to_rgb565_numpy(self, img):
+        """Fast RGB565 via numpy — ~50× faster than pure Python on ARM."""
+        arr = np.frombuffer(img.tobytes(), dtype=np.uint8).reshape(img.height, img.width, 3)
+        r = arr[:, :, 0].astype(np.uint16)
+        g = arr[:, :, 1].astype(np.uint16)
+        b = arr[:, :, 2].astype(np.uint16)
+        rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        ppline = self.stride // 2
+        if ppline == img.width:
+            return rgb565.astype('<u2').tobytes()
+        # Stride padding
+        buf = np.zeros((img.height, ppline), dtype='<u2')
+        buf[:, :img.width] = rgb565
+        return buf.tobytes()
+
+    def _to_rgb565_pure(self, img):
+        """Pure Python fallback for RGB565 conversion."""
         import array as arr
         pixels  = img.load()
-        bpl     = self.stride          # bytes per line in the framebuffer
-        ppline  = bpl // 2             # pixels per line (16bpp = 2 bytes/pixel)
+        ppline  = self.stride // 2
         buf     = arr.array("H", [0] * (ppline * self.height))
         for y in range(img.height):
             row_off = y * ppline
@@ -455,6 +482,7 @@ class GatewayDisplay:
         self._refreshing = False
         self.backlight   = True
         self.last_ref    = 0.0
+        self._last_hash  = None   # dirty-frame detection
 
         set_backlight(True)
 
@@ -516,9 +544,14 @@ class GatewayDisplay:
                 with self._lock:
                     s = dict(self.status)
 
-                frame = self.renderer.render(s, self.backlight, self._refreshing)
-                self.fb.write(frame)
-                time.sleep(1)   # 1 FPS is enough for a status screen
+                # Dirty-frame detection — only redraw if content changed
+                frame_key = (str(s), self.backlight, self._refreshing)
+                if frame_key != self._last_hash:
+                    frame = self.renderer.render(s, self.backlight, self._refreshing)
+                    self.fb.write(frame)
+                    self._last_hash = frame_key
+
+                time.sleep(1)   # 1 FPS polling, draws only on change
         except KeyboardInterrupt:
             self.fb.clear()
             print("\n[DISPLAY] Exited")
