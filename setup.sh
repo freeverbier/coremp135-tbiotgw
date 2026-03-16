@@ -179,7 +179,10 @@ install_prerequisites() {
         software-properties-common \
         net-tools \
         jq \
-        wget
+        wget \
+        python3 \
+        python3-pip \
+        python3-pygame
 
     success "Prerequisites OK"
 }
@@ -612,10 +615,12 @@ setup_display() {
 
     success "Default UI cleared"
 
-    # ---- Install pygame ------------------------------------------------------
-    log "Installing pygame..."
-    pip3 install pygame --break-system-packages -q
-    success "pygame installed"
+    # ---- Install pygame (via apt — already done in install_prerequisites) ----
+    if ! python3 -c "import pygame" 2>/dev/null; then
+        log "Installing pygame via apt..."
+        apt-get install -y -qq python3-pygame
+    fi
+    success "pygame available"
 
     # ---- Deploy display.py from repo ----------------------------------------
     log "Deploying display.py..."
