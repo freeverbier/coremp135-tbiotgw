@@ -181,8 +181,8 @@ install_prerequisites() {
         jq \
         wget \
         python3 \
-        python3-pip \
-        python3-pygame
+        python3-pil \
+        python3-evdev
 
     success "Prerequisites OK"
 }
@@ -615,12 +615,11 @@ setup_display() {
 
     success "Default UI cleared"
 
-    # ---- Install pygame (via apt — already done in install_prerequisites) ----
-    if ! python3 -c "import pygame" 2>/dev/null; then
-        log "Installing pygame via apt..."
-        apt-get install -y -qq python3-pygame
-    fi
-    success "pygame available"
+    # ---- Install Pillow + evdev (via apt — already in install_prerequisites) -
+    local missing=0
+    python3 -c "from PIL import Image" 2>/dev/null || { apt-get install -y -qq python3-pil;   missing=1; }
+    python3 -c "import evdev"          2>/dev/null || { apt-get install -y -qq python3-evdev; missing=1; }
+    success "Pillow + evdev available"
 
     # ---- Deploy display.py from repo ----------------------------------------
     log "Deploying display.py..."
