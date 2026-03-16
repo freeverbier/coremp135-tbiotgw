@@ -353,6 +353,41 @@ NTPCFG
 }
 
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Swap file — TB Gateway 3.x (Python) needs more than 256MB physical RAM
+# to load connectors at startup. A 512MB swap on the SD card prevents OOM kills.
+# Idempotent: skips if /swapfile already exists and is active.
+# -----------------------------------------------------------------------------
+setup_swap() {
+    if swapon --show | grep -q /swapfile; then
+        success "Swap already active ($(swapon --show --bytes | awk '/swapfile/{printf "%.0fMB", $3/1024/1024}'))"
+        return 0
+    fi
+
+    log "Creating 512MB swap file on SD card..."
+
+    if [[ ! -f /swapfile ]]; then
+        fallocate -l 512M /swapfile 2>/dev/null \
+            || dd if=/dev/zero of=/swapfile bs=1M count=512 status=none
+    fi
+
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+
+    # Persist across reboots
+    if ! grep -q '/swapfile' /etc/fstab; then
+        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+
+    # Reduce swappiness — use swap only when really needed
+    echo 'vm.swappiness=10' > /etc/sysctl.d/99-swappiness.conf
+    sysctl -p /etc/sysctl.d/99-swappiness.conf 2>/dev/null || true
+
+    success "Swap active: $(free -h | awk '/Swap/{print $2}')"
+}
+
+# -----------------------------------------------------------------------------
 # System packages
 # -----------------------------------------------------------------------------
 install_prerequisites() {
@@ -484,14 +519,12 @@ services:
     env_file:
       - .env
 
-    # Resource limits — important on ARM Cortex-A7 (single core, 256MB RAM)
+    # CPU limit only — no memory limit: TB Gateway 3.x Python loads connectors at startup
+    # and needs >256MB physical RAM. Memory is managed by the 512MB swap added by setup.sh.
     deploy:
       resources:
         limits:
           cpus: "0.75"     # max 75% of one core
-          memory: 256M
-        reservations:
-          memory: 64M
 
     volumes:
       - tb-gw-config:/thingsboard_gateway/config
@@ -1099,6 +1132,7 @@ main() {
     log "Gateway device name: ${device_name}"
 
     setup_timezone
+    setup_swap               # 512MB swap — prevents OOM kill during TB Gateway connector loading
     install_prerequisites
     install_docker
     install_docker_compose
