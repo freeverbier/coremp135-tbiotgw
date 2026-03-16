@@ -112,11 +112,17 @@ EOF
 # -----------------------------------------------------------------------------
 validate_args() {
     local errors=0
-    [[ -z "$TB_GW_HOST" ]]                       && { warn "Missing --tb-host"; ((errors++)); }
-    [[ -z "$TB_GW_PROVISIONING_DEVICE_KEY" ]]    && { warn "Missing --tb-provision-key"; ((errors++)); }
-    [[ -z "$TB_GW_PROVISIONING_DEVICE_SECRET" ]] && { warn "Missing --tb-provision-secret"; ((errors++)); }
-    [[ -z "$TAILSCALE_AUTH_KEY" ]]               && { warn "Missing --tailscale-key (use 'none' to skip)"; ((errors++)); }
+    # Note: use errors=$((errors+1)) not ((errors++)) — under set -e, ((0++)) exits silently
+    [[ -z "$TB_GW_HOST" ]]                       && { warn "Missing --tb-host";                             errors=$((errors+1)); }
+    [[ -z "$TB_GW_PROVISIONING_DEVICE_KEY" ]]    && { warn "Missing --tb-provision-key";                   errors=$((errors+1)); }
+    [[ -z "$TB_GW_PROVISIONING_DEVICE_SECRET" ]] && { warn "Missing --tb-provision-secret";                errors=$((errors+1)); }
+    [[ -z "$TAILSCALE_AUTH_KEY" ]]               && { warn "Missing --tailscale-key (use 'none' to skip)"; errors=$((errors+1)); }
     [[ $errors -gt 0 ]] && error "Missing required arguments. Run with --help for usage."
+
+    # Dump resolved config for debugging
+    log "Config: TB_GW_HOST=${TB_GW_HOST} PORT=${TB_GW_PORT}"
+    log "Config: TAILSCALE_AUTH_KEY=${TAILSCALE_AUTH_KEY:0:12}..."
+    log "Config: INSTALL_DIR=${INSTALL_DIR}"
 }
 
 # -----------------------------------------------------------------------------
@@ -128,8 +134,14 @@ check_root() {
 
 check_network() {
     log "Checking network connectivity..."
-    if ! curl -sf --max-time 15 https://captive.apple.com > /dev/null 2>&1; then
-        error "No internet connection detected. Check your network."
+    local ok=0
+    for host in 1.1.1.1 8.8.8.8; do
+        if ping -c1 -W3 "$host" > /dev/null 2>&1; then
+            ok=1; break
+        fi
+    done
+    if [[ $ok -eq 0 ]]; then
+        error "No internet connection detected (ping 1.1.1.1 and 8.8.8.8 both failed). Check your network."
     fi
     success "Network OK"
 }
