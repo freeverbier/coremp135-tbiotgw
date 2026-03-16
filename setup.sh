@@ -293,16 +293,16 @@ setup_timezone() {
     # ---- NTP client — cascade: chrony → ntp → systemd-timesyncd (always present) ----
     local ntp_client=""
 
-    if command -v chronyd &>/dev/null; then
+    if command -v chronyd &>/dev/null || command -v chronyc &>/dev/null; then
         ntp_client="chrony"
     elif apt-cache show chrony &>/dev/null 2>&1; then
         log "Installing chrony (NTP client)..."
-        apt-get install -y -qq chrony && ntp_client="chrony"
+        apt-get install -y -qq chrony && ntp_client="chrony" || true
     fi
 
     if [[ -z "$ntp_client" ]] && apt-cache show ntp &>/dev/null 2>&1; then
         log "chrony not available — installing ntp..."
-        apt-get install -y -qq ntp && ntp_client="ntp"
+        apt-get install -y -qq ntp && ntp_client="ntp" || true
     fi
 
     if [[ -z "$ntp_client" ]]; then
