@@ -182,7 +182,8 @@ install_prerequisites() {
         wget \
         python3 \
         python3-pil \
-        python3-evdev
+        python3-evdev \
+        fonts-dejavu-core
 
     success "Prerequisites OK"
 }

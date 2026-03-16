@@ -82,11 +82,18 @@ class Framebuffer:
 
     def __init__(self, device=FB_DEVICE):
         self.device = device
-        self.bpp    = self._read_sysfs("bits_per_pixel", default=16)
+        self.bpp    = int(self._read_sysfs("bits_per_pixel", default="16"))
         w, h        = self._read_sysfs("virtual_size", default="320,240").split(",")
         self.width  = int(w)
         self.height = int(h)
-        print(f"[FB] {device}  {self.width}×{self.height}  {self.bpp}bpp")
+        # stride = bytes per line (may include padding)
+        stride_raw  = self._read_sysfs("stride", default=None)
+        if stride_raw:
+            self.stride = int(stride_raw)
+        else:
+            self.stride = self.width * (self.bpp // 8)
+        self.fb_size = self.stride * self.height
+        print(f"[FB] {device}  {self.width}×{self.height}  {self.bpp}bpp  stride={self.stride}  total={self.fb_size}B")
 
     def _fb_name(self):
         return Path(self.device).name   # e.g. "fb1"
@@ -102,37 +109,41 @@ class Framebuffer:
         """Write PIL Image (RGB) to framebuffer."""
         img = img.convert("RGB").resize((self.width, self.height))
         if self.bpp == 16:
-            data = self._to_rgb565(img)
+            data = self._to_rgb565_strided(img)
         else:
-            data = self._to_rgb32(img)
+            data = self._to_rgb32_strided(img)
         try:
-            with open(self.device, "wb") as fb:
+            with open(self.device, "rb+") as fb:
+                fb.seek(0)
                 fb.write(data)
         except PermissionError:
             print(f"[FB] Permission denied on {self.device} — run as root")
         except Exception as e:
             print(f"[FB] Write error: {e}")
 
-    @staticmethod
-    def _to_rgb565(img):
+    def _to_rgb565_strided(self, img):
         import array as arr
-        pixels = img.load()
-        buf = arr.array("H")   # unsigned short
+        pixels  = img.load()
+        bpl     = self.stride          # bytes per line in the framebuffer
+        ppline  = bpl // 2             # pixels per line (16bpp = 2 bytes/pixel)
+        buf     = arr.array("H", [0] * (ppline * self.height))
         for y in range(img.height):
+            row_off = y * ppline
             for x in range(img.width):
                 r, g, b = pixels[x, y][:3]
-                buf.append(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3))
+                buf[row_off + x] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
         return buf.tobytes()
 
-    @staticmethod
-    def _to_rgb32(img):
-        """XRGB8888 (32bpp, typical for DRM/KMS)."""
-        out = bytearray()
+    def _to_rgb32_strided(self, img):
+        """XRGB8888 (32bpp) with stride support."""
+        out    = bytearray(self.fb_size)
         pixels = img.load()
+        bpl    = self.stride
         for y in range(img.height):
             for x in range(img.width):
-                r, g, b = pixels[x, y][:3]
-                out += struct.pack("<BBBB", b, g, r, 0xFF)
+                r, g, b  = pixels[x, y][:3]
+                off      = y * bpl + x * 4
+                out[off:off+4] = struct.pack("<BBBB", b, g, r, 0xFF)
         return bytes(out)
 
     def clear(self, color=(0, 0, 0)):
@@ -221,27 +232,32 @@ def get_uptime():
 def load_font(size, bold=False):
     candidates = [
         f"/usr/share/fonts/truetype/dejavu/DejaVuSansMono{'-Bold' if bold else ''}.ttf",
+        f"/usr/share/fonts/truetype/dejavu/DejaVuSans{'-Bold' if bold else ''}.ttf",
         f"/usr/share/fonts/truetype/liberation/LiberationMono-{'Bold' if bold else 'Regular'}.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        f"/usr/share/fonts/truetype/liberation/LiberationSans-{'Bold' if bold else 'Regular'}.ttf",
         "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
     ]
     for path in candidates:
         if os.path.exists(path):
             try:
-                return ImageFont.truetype(path, size)
+                f = ImageFont.truetype(path, size)
+                print(f"[FONT] Loaded {path} @{size}px")
+                return f
             except Exception:
                 pass
+    print(f"[FONT] No TTF found for size={size}, using default (text may be tiny)")
     return ImageFont.load_default()
 
 # ---------------------------------------------------------------------------
 # Renderer
 # ---------------------------------------------------------------------------
 class Renderer:
-    TITLE_H  = 26
-    ROW_H    = 38
-    INFO_H   = 20
+    TITLE_H  = 30
+    ROW_H    = 42
+    INFO_H   = 22
     BTN_H    = 34
-    STRIPE_W = 5
+    STRIPE_W = 6
     MARGIN   = 10
 
     STATUS_COLORS = {
@@ -262,10 +278,10 @@ class Renderer:
     }
 
     def __init__(self):
-        self.f_title  = load_font(13, bold=True)
-        self.f_label  = load_font(12, bold=True)
-        self.f_value  = load_font(12)
-        self.f_small  = load_font(10)
+        self.f_title  = load_font(16, bold=True)
+        self.f_label  = load_font(14, bold=True)
+        self.f_value  = load_font(14)
+        self.f_small  = load_font(12)
 
         # Button rects as (x, y, w, h)
         btn_y = SCREEN_H - self.BTN_H
