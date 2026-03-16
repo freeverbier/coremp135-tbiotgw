@@ -541,35 +541,37 @@ ENVFILE
 # Prints the token or nothing. Always exits 0.
 # -----------------------------------------------------------------------------
 _read_tb_token() {
+    # NOTE: path is hardcoded inside the container — do NOT use shell var expansion
+    # inside the single-quoted sh -c block (set -u on the host would fail on $CFG).
     docker exec tb-gateway sh -c '
 CFG=/thingsboard_gateway/config/tb_gateway.json
 [ -f "$CFG" ] || exit 0
 
 # Try python3 first (available in TB Gateway 3.x image)
 if command -v python3 >/dev/null 2>&1; then
-    python3 - <<PYEOF 2>/dev/null
+    python3 -c "
 import json
 try:
-    with open("'"$CFG"'") as f:
+    with open(\"/thingsboard_gateway/config/tb_gateway.json\") as f:
         d = json.load(f)
-    tb = d.get("thingsboard", {}) or {}
-    t = (tb.get("security", {}).get("accessToken")
-         or tb.get("credentials", {}).get("token")
-         or tb.get("credentials", {}).get("accessToken")
-         or d.get("security", {}).get("accessToken", ""))
-    if t and t not in ("YOUR_ACCESS_TOKEN", "null", ""):
+    tb = d.get(\"thingsboard\", {}) or {}
+    t = (tb.get(\"security\", {}).get(\"accessToken\")
+         or tb.get(\"credentials\", {}).get(\"token\")
+         or tb.get(\"credentials\", {}).get(\"accessToken\")
+         or d.get(\"security\", {}).get(\"accessToken\", \"\"))
+    if t and t not in (\"YOUR_ACCESS_TOKEN\", \"null\", \"\"):
         print(t.strip())
 except Exception:
     pass
-PYEOF
+" 2>/dev/null
     exit 0
 fi
 
-# Fallback: grep-based extraction
+# Fallback: pure grep+sed extraction (no python3 required)
 grep -o "\"accessToken\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$CFG" 2>/dev/null \
     | grep -v "YOUR_ACCESS_TOKEN" \
     | head -1 \
-    | sed '"'"'s/.*"accessToken"[[:space:]]*:[[:space:]]*"//;s/".*//'"'"' \
+    | sed "s/.*\"accessToken\"[[:space:]]*:[[:space:]]*\"//;s/\".*//" \
     || true
 ' 2>/dev/null || true
 }
