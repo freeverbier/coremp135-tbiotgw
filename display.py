@@ -195,18 +195,47 @@ def get_tailscale_status():
         return "error", None
 
 def get_tb_status():
+    # 1. Check container is running
     rc, out = _run(["docker", "inspect", "--format", "{{.State.Status}}", "tb-gateway"])
     if rc != 0 or "running" not in out:
         return "stopped"
-    _, logs = _run(["docker", "logs", "--tail", "80", "tb-gateway"], timeout=6)
-    logs = logs.lower()
-    if any(k in logs for k in ("connected to thingsboard", "gateway connected",
-                                "provisioning was successful", "[connected]")):
+
+    # 2. Scan recent logs with specific patterns to avoid false positives
+    _, logs = _run(["docker", "logs", "--tail", "120", "tb-gateway"], timeout=6)
+    ll = logs.lower()
+
+    # Positive — definitive connection confirmations
+    connected_kw = [
+        "connected to thingsboard",
+        "successfully connected",
+        "tb client connected",
+        "gateway connected",
+        "provisioning was successful",
+        "[connected]",
+        "connection established",
+    ]
+    if any(k in ll for k in connected_kw):
         return "connected"
-    if "provision" in logs:
+
+    # Provisioning in progress
+    if any(k in ll for k in ("provision", "registering device", "device registration")):
         return "provisioning"
-    if any(k in logs for k in ("error", "exception", "refused", "timeout")):
+
+    # Specific connection errors only — NOT the generic word "error"
+    error_kw = [
+        "connection refused",
+        "authentication failed",
+        "failed to connect",
+        "error connecting",
+        "unable to connect",
+        "connectionexception",
+        "mqtt disconnect",
+        "handshake_failure",
+    ]
+    if any(k in ll for k in error_kw):
         return "error"
+
+    # Container running, status not yet determinable from logs
     return "running"
 
 def get_eth0_ip():
