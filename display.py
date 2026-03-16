@@ -227,43 +227,55 @@ def get_tb_status():
     if rc != 0 or "running" not in out:
         return "stopped"
 
-    # 2. Scan recent logs with specific patterns to avoid false positives
-    _, logs = _run(["docker", "logs", "--tail", "120", "tb-gateway"], timeout=6)
+    # 2. Most reliable indicator: check if a real access token is present in config
+    #    (placeholder "YOUR_ACCESS_TOKEN" means provisioning not yet complete)
+    rc2, cfg = _run(
+        ["docker", "exec", "tb-gateway",
+         "sh", "-c", "cat /thingsboard_gateway/config/tb_gateway.json 2>/dev/null"],
+        timeout=4
+    )
+    if rc2 == 0 and cfg:
+        try:
+            d     = json.loads(cfg)
+            token = (d.get("thingsboard", {}).get("security", {}).get("accessToken")
+                     or d.get("security", {}).get("accessToken", ""))
+            if token and token not in ("YOUR_ACCESS_TOKEN", "null", ""):
+                return "connected"
+            else:
+                return "provisioning"
+        except Exception:
+            pass
+
+    # 3. Fallback: read log file from the volume (TB Gateway logs to files, not stdout)
+    rc3, logs = _run(
+        ["docker", "exec", "tb-gateway",
+         "sh", "-c", "tail -80 /thingsboard_gateway/logs/thingsboard_gateway.log 2>/dev/null || true"],
+        timeout=5
+    )
+    if not logs:
+        # Last resort: docker logs (may be empty if container uses file logging)
+        _, logs = _run(["docker", "logs", "--tail", "80", "tb-gateway"], timeout=5)
+
     ll = logs.lower()
 
-    # Positive — definitive connection confirmations (keywords from actual TB Gateway logs)
     connected_kw = [
-        "connected to platform",           # tb_client.py: "MQTT client connected to platform ..."
-        "- connected!",                    # tb_device_mqtt.py: "MQTT client ... - Connected!"
+        "connected to platform",
+        "- connected!",
         "connected to thingsboard",
         "successfully connected",
-        "tb client connected",
-        "gateway connected",
         "provisioning was successful",
-        "connection established",
     ]
     if any(k in ll for k in connected_kw):
         return "connected"
 
-    # Provisioning in progress
-    if any(k in ll for k in ("provision", "registering device", "device registration")):
+    if any(k in ll for k in ("provision", "registering device")):
         return "provisioning"
 
-    # Specific connection errors only — NOT the generic word "error"
-    error_kw = [
-        "connection refused",
-        "authentication failed",
-        "failed to connect",
-        "error connecting",
-        "unable to connect",
-        "connectionexception",
-        "mqtt disconnect",
-        "handshake_failure",
-    ]
+    error_kw = ["connection refused", "authentication failed",
+                "failed to connect", "connectionexception", "handshake_failure"]
     if any(k in ll for k in error_kw):
         return "error"
 
-    # Container running, status not yet determinable from logs
     return "running"
 
 def get_eth0_ip():
