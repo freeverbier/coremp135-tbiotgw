@@ -285,6 +285,16 @@ def get_eth0_ip():
             return line.strip().split()[1].split("/")[0]
     return "unknown"
 
+def get_mac():
+    try:
+        return Path("/sys/class/net/eth0/address").read_text().strip()
+    except Exception:
+        rc, out = _run(["ip", "link", "show", "eth0"])
+        for line in out.splitlines():
+            if "link/ether" in line:
+                return line.strip().split()[1]
+    return "unknown"
+
 def get_uptime():
     try:
         secs = float(Path("/proc/uptime").read_text().split()[0])
@@ -411,18 +421,22 @@ class Renderer:
         self._txt(draw, self.f_value, status.get("eth0_ip", "—"), (x, y + 19))
         y += self.ROW_H + 2
 
-        # ---- Info strip ------------------------------------------------------
+        # ---- Info strip  (MAC  |  uptime  |  refresh time) ------------------
         draw.rectangle([0, y, SCREEN_W, y + self.INFO_H], fill=(25, 25, 25))
-        uptime = status.get("uptime", "")
-        ref    = status.get("refreshed_at", "")
-        self._txt(draw, self.f_small, f" up {uptime}", (0, y + 4), GRAY)
-        ref_txt = f"{'refreshing…' if refreshing else ref}"
-        # right-align the refresh time
+        mac     = status.get("mac", "")
+        uptime  = status.get("uptime", "")
+        ref_txt = "…" if refreshing else status.get("refreshed_at", "")
+
+        # left: MAC address
+        self._txt(draw, self.f_small, f" {mac}", (0, y + 4), GRAY)
+
+        # right: "up 3h 12m  09:21"
+        right_txt = f"up {uptime}  {ref_txt}"
         try:
-            tw = self.f_small.getlength(ref_txt)
+            tw = self.f_small.getlength(right_txt)
         except AttributeError:
-            tw = len(ref_txt) * 6
-        self._txt(draw, self.f_small, ref_txt, (SCREEN_W - tw - 4, y + 4), GRAY)
+            tw = len(right_txt) * 6
+        self._txt(draw, self.f_small, right_txt, (SCREEN_W - tw - 4, y + 4), GRAY)
         y += self.INFO_H
 
         # ---- Buttons ---------------------------------------------------------
@@ -524,6 +538,7 @@ class GatewayDisplay:
                 "ts_state":      ts_state,
                 "ts_ip":         ts_ip or "—",
                 "eth0_ip":       get_eth0_ip(),
+                "mac":           get_mac(),
                 "uptime":        get_uptime(),
                 "hostname":      socket.gethostname(),
                 "refreshed_at":  time.strftime("%H:%M:%S"),

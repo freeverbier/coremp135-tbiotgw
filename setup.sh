@@ -53,6 +53,7 @@ TAILSCALE_HOSTNAME=""      # Auto-detected if empty
 INSTALL_DIR="/opt/tb-gateway"
 ENV_FILE=""
 ATTR_REPORT_INTERVAL="300" # Attribute report interval in seconds (default: 5 min)
+TIMEZONE="Europe/Zurich"   # Default timezone
 
 # -----------------------------------------------------------------------------
 # Argument parsing
@@ -68,6 +69,7 @@ parse_args() {
             --tailscale-hostname=*)   TAILSCALE_HOSTNAME="${arg#*=}" ;;
             --tb-http-port=*)         TB_GW_HTTP_PORT="${arg#*=}" ;;
             --attr-interval=*)        ATTR_REPORT_INTERVAL="${arg#*=}" ;;
+            --timezone=*)             TIMEZONE="${arg#*=}" ;;
             --install-dir=*)          INSTALL_DIR="${arg#*=}" ;;
             --env-file=*)             ENV_FILE="${arg#*=}" ;;
             --help|-h)                usage; exit 0 ;;
@@ -101,6 +103,7 @@ Optional:
   --tb-http-port=PORT          ThingsBoard HTTPS port for device API (default: 443)
   --tailscale-hostname=NAME    Tailscale hostname override (default: coremp135-<MAC>)
   --attr-interval=SECS         Attribute report interval in seconds (default: 300)
+  --timezone=TZ                Timezone (default: Europe/Zurich) e.g. Europe/Paris
   --install-dir=DIR            Installation directory (default: /opt/tb-gateway)
   --env-file=FILE              Load all config from a .env file
   --help                       Show this help
@@ -160,6 +163,53 @@ get_eth0_mac() {
     fi
     [[ -z "$mac" ]] && error "Cannot determine eth0 MAC address"
     echo "$mac"
+}
+
+# -----------------------------------------------------------------------------
+# Timezone + NTP
+# -----------------------------------------------------------------------------
+setup_timezone() {
+    log "Configuring timezone: ${TIMEZONE}..."
+
+    # Validate timezone exists
+    if [[ ! -f "/usr/share/zoneinfo/${TIMEZONE}" ]]; then
+        warn "Unknown timezone '${TIMEZONE}' — skipping (keeping current: $(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone))"
+        return 0
+    fi
+
+    timedatectl set-timezone "${TIMEZONE}"
+    success "Timezone set to ${TIMEZONE}"
+
+    # Ensure chrony is installed (more reliable than systemd-timesyncd on embedded)
+    if ! command -v chronyd &>/dev/null; then
+        log "Installing chrony (NTP client)..."
+        apt-get install -y -qq chrony
+    fi
+
+    # Enable and start chrony
+    systemctl enable --now chrony 2>/dev/null || systemctl enable --now chronyd 2>/dev/null || true
+
+    # Disable systemd-timesyncd if chrony takes over (avoid conflicts)
+    systemctl disable --now systemd-timesyncd 2>/dev/null || true
+
+    # Force immediate time sync
+    log "Forcing NTP sync..."
+    chronyc makestep 2>/dev/null || true
+
+    # Wait up to 10s for sync
+    local synced=0
+    for i in $(seq 1 5); do
+        if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q "yes"; then
+            synced=1; break
+        fi
+        sleep 2
+    done
+
+    if [[ $synced -eq 1 ]]; then
+        success "NTP synchronized — $(date)"
+    else
+        warn "NTP sync pending — current time: $(date) (will sync once network is stable)"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -689,6 +739,7 @@ print_summary() {
     echo -e "  ${BOLD}Device${NC}"
     echo -e "    MAC (eth0):        ${mac_address}"
     echo -e "    Tailscale IP:      ${ts_ip}"
+    echo -e "    Timezone:          ${TIMEZONE}  ($(date))"
     echo ""
     echo -e "  ${BOLD}ThingsBoard Gateway${NC}"
     echo -e "    Server:            ${TB_GW_HOST}:${TB_GW_PORT}"
@@ -724,6 +775,7 @@ main() {
     mac_address=$(get_eth0_mac)
     log "eth0 MAC address: ${mac_address}"
 
+    setup_timezone
     install_prerequisites
     install_docker
     install_docker_compose
