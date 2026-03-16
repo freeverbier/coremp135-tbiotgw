@@ -136,17 +136,32 @@ validate_args() {
 expand_filesystem() {
     log "Checking if SD card filesystem needs expansion..."
 
-    # ---- Detect root partition (e.g. /dev/mmcblk0p2 or /dev/sda2) ----------
+    # ---- Detect root partition (e.g. /dev/mmcblk0p5 or /dev/sda2) ----------
     local root_dev
-    root_dev=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/\[.*\]//')
+    root_dev=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/\[.*\]//' || true)
     if [[ -z "$root_dev" ]]; then
         warn "Could not determine root device — skipping filesystem expansion"
         return 0
     fi
 
-    # ---- Detect parent disk (strip trailing partition number/suffix) ---------
+    # ---- Detect parent disk -------------------------------------------------
+    # Try lsblk PKNAME first; fall back to string manipulation.
+    #   mmcblk0p5 → mmcblk0   (strip trailing pN)
+    #   sda2      → sda        (strip trailing N)
     local disk disk_name
-    disk_name=$(lsblk -no PKNAME "$root_dev" 2>/dev/null)
+    disk_name=$(lsblk -no PKNAME "$root_dev" 2>/dev/null || true)
+    if [[ -z "$disk_name" ]]; then
+        # Fallback: strip partition suffix from device name.
+        # mmcblkXpN  → strip 'pN'   (e.g. mmcblk0p5 → mmcblk0)
+        # sdXN       → strip digits  (e.g. sda2 → sda)
+        local _base
+        _base=$(basename "$root_dev")
+        if [[ "$_base" =~ p[0-9]+$ ]]; then
+            disk_name="${_base%p*}"          # mmcblk0p5 → mmcblk0
+        else
+            disk_name=$(echo "$_base" | sed 's/[0-9]*$//')   # sda2 → sda
+        fi
+    fi
     if [[ -z "$disk_name" ]]; then
         warn "Could not determine parent disk for $root_dev — skipping"
         return 0
@@ -154,11 +169,17 @@ expand_filesystem() {
     disk="/dev/${disk_name}"
 
     # ---- Detect partition number --------------------------------------------
-    # Works for mmcblk0p2 (→ 2) and sda2 (→ 2)
+    # lsblk PARTN not available on older kernels — use string parsing instead.
+    # mmcblk0p5 → 5    sda2 → 2
     local part_num
-    part_num=$(lsblk -no PARTN "$root_dev" 2>/dev/null)
+    part_num=$(lsblk -no PARTN "$root_dev" 2>/dev/null || true)
     if [[ -z "$part_num" ]]; then
-        part_num=$(echo "$root_dev" | grep -o '[0-9]*$')
+        # For mmcblkXpN devices, extract the number after 'p'
+        # For sdXN devices, extract trailing digits
+        part_num=$(basename "$root_dev" | grep -oP '(?<=p)\d+$' || true)
+        if [[ -z "$part_num" ]]; then
+            part_num=$(basename "$root_dev" | grep -oP '\d+$' || true)
+        fi
     fi
     if [[ -z "$part_num" ]]; then
         warn "Could not determine partition number for $root_dev — skipping"
