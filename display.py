@@ -221,7 +221,43 @@ def get_tailscale_status():
     except Exception:
         return "error", None
 
-def get_tb_status():
+def _extract_tb_token(d: dict) -> str:
+    """
+    Extract the access token from a tb_gateway.json dict.
+    Handles all known ThingsBoard Gateway config layouts:
+      • thingsboard.security.accessToken   (provisioning result, most common)
+      • thingsboard.credentials.token      (some versions)
+      • thingsboard.credentials.accessToken
+      • security.accessToken               (legacy flat layout)
+    Returns the token string, or "" if not found / still placeholder.
+    """
+    placeholders = {"YOUR_ACCESS_TOKEN", "null", ""}
+
+    def _clean(v):
+        return "" if (v is None or str(v).strip() in placeholders) else str(v).strip()
+
+    tb = d.get("thingsboard", {}) or {}
+
+    # Path 1: thingsboard.security.accessToken
+    t = _clean(tb.get("security", {}).get("accessToken"))
+    if t:
+        return t
+
+    # Path 2: thingsboard.credentials.*
+    creds = tb.get("credentials", {}) or {}
+    t = _clean(creds.get("token") or creds.get("accessToken"))
+    if t:
+        return t
+
+    # Path 3: flat security at root
+    t = _clean(d.get("security", {}).get("accessToken"))
+    if t:
+        return t
+
+    return ""
+
+
+def get_tb_status(debug: bool = False) -> str:
     # 1. Check container is running
     rc, out = _run(["docker", "inspect", "--format", "{{.State.Status}}", "tb-gateway"])
     if rc != 0 or "running" not in out:
@@ -232,19 +268,24 @@ def get_tb_status():
     rc2, cfg = _run(
         ["docker", "exec", "tb-gateway",
          "sh", "-c", "cat /thingsboard_gateway/config/tb_gateway.json 2>/dev/null"],
-        timeout=4
+        timeout=5
     )
-    if rc2 == 0 and cfg:
+    if debug:
+        print(f"[DEBUG-TB] rc={rc2}  cfg_len={len(cfg)}  cfg_preview={cfg[:300]!r}")
+
+    if rc2 == 0 and cfg.strip():
         try:
             d     = json.loads(cfg)
-            token = (d.get("thingsboard", {}).get("security", {}).get("accessToken")
-                     or d.get("security", {}).get("accessToken", ""))
-            if token and token not in ("YOUR_ACCESS_TOKEN", "null", ""):
+            token = _extract_tb_token(d)
+            if debug:
+                print(f"[DEBUG-TB] extracted token={token!r}")
+            if token:
                 return "connected"
             else:
                 return "provisioning"
-        except Exception:
-            pass
+        except json.JSONDecodeError as e:
+            if debug:
+                print(f"[DEBUG-TB] JSON parse error: {e}")
 
     # 3. Fallback: read log file from the volume (TB Gateway logs to files, not stdout)
     rc3, logs = _run(
@@ -500,7 +541,7 @@ class TouchReader(threading.Thread):
 # Main application
 # ---------------------------------------------------------------------------
 class GatewayDisplay:
-    def __init__(self):
+    def __init__(self, debug_tb: bool = False):
         self.fb          = Framebuffer(FB_DEVICE)
         self.renderer    = Renderer()
         self.status      = {}
@@ -509,6 +550,7 @@ class GatewayDisplay:
         self.backlight   = True
         self.last_ref    = 0.0
         self._last_hash  = None   # dirty-frame detection
+        self._debug_tb   = debug_tb
 
         set_backlight(True)
 
@@ -531,7 +573,7 @@ class GatewayDisplay:
 
     def _do_refresh(self):
         ts_state, ts_ip = get_tailscale_status()
-        tb_state         = get_tb_status()
+        tb_state         = get_tb_status(debug=self._debug_tb)
         with self._lock:
             self.status = {
                 "tb_state":      tb_state,
@@ -587,9 +629,23 @@ class GatewayDisplay:
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="CoreMP135 IoT Gateway status display")
+    ap.add_argument("--debug-tb", action="store_true",
+                    help="Print raw ThingsBoard config JSON and extracted token at each refresh")
+    ap.add_argument("--test-tb", action="store_true",
+                    help="Run get_tb_status() once with debug output and exit (no display)")
+    args = ap.parse_args()
+
+    if args.test_tb:
+        print("=== ThingsBoard status diagnostic ===")
+        result = get_tb_status(debug=True)
+        print(f"==> get_tb_status() returned: {result!r}")
+        sys.exit(0)
+
     # Quick FB probe
     if not os.path.exists(FB_DEVICE):
         print(f"[ERROR] Framebuffer {FB_DEVICE} not found")
         sys.exit(1)
 
-    GatewayDisplay().run()
+    GatewayDisplay(debug_tb=args.debug_tb).run()
